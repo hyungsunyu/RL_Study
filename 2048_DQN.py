@@ -462,7 +462,7 @@ def train_2048_with_visual():
                 q_t.load_state_dict(q.state_dict())
 
         if ep % 100 == 0:
-            print(f"[ep {ep}] score={env.score} best={best_score} (best_ep={best_episode}) steps={ep_steps} eps={linear_epsilon(global_step, hp):.3f}")
+            print(f"[ep {ep}] score={env.score} steps={ep_steps} eps={linear_epsilon(global_step, hp):.3f} best={best_score} (best_ep={best_episode})")
 
         if renderer is not None and not renderer.running:
             break
