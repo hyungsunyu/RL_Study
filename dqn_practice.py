@@ -2,6 +2,7 @@ import gymnasium as gym
 import collections
 import random
 import numpy as np
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -14,6 +15,8 @@ gamma         = 0.98
 buffer_limit  = 50000
 batch_size    = 32
 
+CHECKPOINT_EPISODES = [1, 10, 100, 1000, 10000]
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -22,7 +25,6 @@ class ReplayBuffer:
         self.buffer = collections.deque(maxlen=buffer_limit)
 
     def put(self, transition):
-        # transition: (s, a, r, s_prime, done_mask)
         self.buffer.append(transition)
 
     def sample(self, n):
@@ -36,14 +38,12 @@ class ReplayBuffer:
             s_prime_lst.append(s_prime)
             done_mask_lst.append([done_mask])
 
-        # Fast conversion (fixes "Creating a tensor from a list..." warning)
-        s_arr    = np.asarray(s_lst,       dtype=np.float32)
-        a_arr    = np.asarray(a_lst,       dtype=np.int64)
-        r_arr    = np.asarray(r_lst,       dtype=np.float32)
-        sp_arr   = np.asarray(s_prime_lst, dtype=np.float32)
+        s_arr    = np.asarray(s_lst,         dtype=np.float32)
+        a_arr    = np.asarray(a_lst,         dtype=np.int64)
+        r_arr    = np.asarray(r_lst,         dtype=np.float32)
+        sp_arr   = np.asarray(s_prime_lst,   dtype=np.float32)
         done_arr = np.asarray(done_mask_lst, dtype=np.float32)
 
-        # Keep on CPU here; move to GPU inside train() in one place
         return (torch.from_numpy(s_arr),
                 torch.from_numpy(a_arr),
                 torch.from_numpy(r_arr),
@@ -67,10 +67,8 @@ class Qnet(nn.Module):
         return self.fc3(x)
 
     def sample_action(self, obs, epsilon):
-        # obs: torch.Tensor [4] or [1,4], already on device
         if random.random() < epsilon:
             return random.randint(0, 1)
-
         with torch.no_grad():
             q = self.forward(obs)
             return q.argmax().item()
@@ -81,7 +79,6 @@ def train(q, q_target, memory, optimizer):
     for _ in range(10):
         s, a, r, s_prime, done_mask = memory.sample(batch_size)
 
-        # Move batch to GPU (core point)
         s         = s.to(device)
         a         = a.to(device)
         r         = r.to(device)
@@ -102,26 +99,45 @@ def train(q, q_target, memory, optimizer):
         optimizer.step()
 
 
+def play_one_episode_render(q, env_render, title: str = ""):
+    """greedy(ε=0)로 1판만 human 렌더 플레이"""
+    q.eval()
+    s, _ = env_render.reset()
+    done = False
+    ep_return = 0.0
+
+    if title:
+        print(title)
+
+    while not done:
+        env_render.render()
+        obs_t = torch.from_numpy(s).float().to(device)
+        a = q.sample_action(obs_t, epsilon=0.0)
+
+        s, r, terminated, truncated, _ = env_render.step(a)
+        done = terminated or truncated
+        ep_return += r
+
+    return ep_return
+
+
 def main():
-    env = gym.make("CartPole-v1")  # 렌더 필요하면 render_mode="human" (추가 설치 필요할 수 있음)
+    env = gym.make("CartPole-v1")  # 학습용
+    memory = ReplayBuffer()
 
     q = Qnet().to(device)
     q_target = Qnet().to(device)
     q_target.load_state_dict(q.state_dict())
-
-    memory = ReplayBuffer()
     optimizer = optim.Adam(q.parameters(), lr=learning_rate)
 
     print_interval = 20
     score = 0.0
 
-    # GPU가 제대로 붙었는지 1회 출력
-    print(f"device: {device}")
-    if device.type == "cuda":
-        print(f"gpu: {torch.cuda.get_device_name(0)}")
+    # ✅ 체크포인트(메모리 저장)
+    checkpoints = {}  # {episode: state_dict}
 
-    for n_epi in range(10000):
-        epsilon = max(0.01, 0.08 - 0.01 * (n_epi / 200))  # 8% -> 1%
+    for n_epi in range(1, 10001):
+        epsilon = max(0.01, 0.08 - 0.01 * (n_epi / 200))
         s, _ = env.reset()
 
         done = False
@@ -129,30 +145,50 @@ def main():
             obs_t = torch.from_numpy(s).float().to(device)
             a = q.sample_action(obs_t, epsilon)
 
-            # gymnasium: step returns (obs, reward, terminated, truncated, info)
             s_prime, r, terminated, truncated, _ = env.step(a)
             done = terminated or truncated
             done_mask = 0.0 if done else 1.0
 
             memory.put((s, a, r / 100.0, s_prime, done_mask))
             s = s_prime
-
             score += r
 
         if memory.size() > 2000:
             train(q, q_target, memory, optimizer)
 
-        if n_epi % print_interval == 0 and n_epi != 0:
+        if n_epi % print_interval == 0:
             q_target.load_state_dict(q.state_dict())
             print(
-                "n_episode :{}, score : {:.1f}, n_buffer : {}, eps : {:.1f}%".format(
-                    n_epi, score / print_interval, memory.size(), epsilon * 100
-                )
+                f"n_episode :{n_epi}, score : {score / print_interval:.1f}, "
+                f"n_buffer : {memory.size()}, eps : {epsilon * 100:.1f}%"
             )
             score = 0.0
-        # torch.save(q.state_dict(), "dqn_cartpole.pt")
-        # print("Saved model to dqn_cartpole.pt")
+
+        # ✅ 에피소드 끝난 시점의 q 저장
+        if n_epi in CHECKPOINT_EPISODES:
+            checkpoints[n_epi] = deepcopy(q.state_dict())
+            print(f"[CKPT] saved checkpoint at episode {n_epi}")
+
     env.close()
+
+    # ===== 학습 종료 후 시각화 =====
+    try:
+        env_render = gym.make("CartPole-v1", render_mode="human")
+    except Exception:
+        print("[INFO] render_mode='human' 환경 생성 실패 (pygame 미설치 등).")
+        return
+
+    # 체크포인트 순서대로 1판씩 재생
+    for ep in CHECKPOINT_EPISODES:
+        if ep not in checkpoints:
+            print(f"[WARN] checkpoint for episode {ep} not found.")
+            continue
+
+        q.load_state_dict(checkpoints[ep])
+        ret = play_one_episode_render(q, env_render, title=f"\n=== Visualize checkpoint episode {ep} ===")
+        print(f"[VIS] episode {ep}: greedy return = {ret:.1f}")
+
+    env_render.close()
 
 
 if __name__ == "__main__":
