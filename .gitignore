@@ -25,3 +25,14 @@ minimalRL/
 
 # 시뮬 결과
 replays_best/
+
+# DQN 폴더
+DQN/
+
+# 기타 파일
+*.mat
+environment.py
+new_train_2048.py
+*.m
+train_2048.py
+DQN.py
